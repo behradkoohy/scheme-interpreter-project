@@ -1,4 +1,5 @@
 import Text.ParserCombinators.Parsec hiding (spaces)
+import Control.Monad.Except
 import System.Environment
 import Control.Monad
 import Numeric
@@ -17,10 +18,21 @@ data LispVal =    Atom String
                 | Ratio Rational
                 | Complex (Complex (Double))
 
+data LispError =    NumArgs Integer [LispVal]
+                   | TypeMismatch String LispVal
+                   | Parser ParseError
+                   | BadSpecialForm String LispVal
+                   | NotFunction String String
+                   | UnboundVar String String
+                   | Default String
+
+type ThrowsError = Either LispError
+
 instance Show LispVal where show = showVal
+instance Show LispError where show = showError
 
 
-primitives :: [(String, [LispVal] -> LispVal)]
+primitives :: [(String, [LispVal] -> ThrowsError LispVal)]
 primitives = [("+", numericBinop (+)),
               ("-", numericBinop (-)),
               ("*", numericBinop (*)),
@@ -36,48 +48,56 @@ primitives = [("+", numericBinop (+)),
               ("symbol->string", unaryOp symbToStr),
               ("string->symbol", unaryOp strToSymb)]
 
-numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> LispVal
-numericBinop op params = Number $ foldl1 op $ map unpackNum params
+numericBinop :: (Integer -> Integer -> Integer) -> [LispVal] -> ThrowsError LispVal
+numericBinop op           []  = throwError $ NumArgs 2 []
+numericBinop op singleVal@[_] = throwError $ NumArgs 2 singleVal
+numericBinop op params        = mapM unpackNum params >>= return . Number . foldl1 op
 
-unaryOp :: (LispVal -> LispVal) -> [LispVal] -> LispVal
-unaryOp f [x] = f x 
+unaryOp :: (LispVal -> ThrowsError LispVal) -> [LispVal] -> ThrowsError LispVal
+unaryOp f [v] = f v
+-- unaryOp f l@(x:_) = throwError $ NumArgs 1 l 
 
-symbToStr :: LispVal -> LispVal
-symbToStr (Atom s) = (String s)
-symbToStr _ = (String "")
 
-strToSymb :: LispVal -> LispVal
-strToSymb (String s) = (Atom s)
-strToSymb _ = (String "")
 
-symbolp :: LispVal -> LispVal
-symbolp (Atom _) = Bool True
-symbolp _ = Bool False
+symbolp, numberp, stringp, boolp, listp, symbToStr, strToSymb :: LispVal -> ThrowsError LispVal
+symbolp (Atom _) = return $ Bool True
+symbolp _ = return $ Bool False
 
-stringp :: LispVal -> LispVal
-stringp (String _) = Bool True
-stringp _ = Bool False
+symbToStr (Atom s) = return (String s)
+symbToStr s = throwError $ TypeMismatch "symbol" s
 
-numberp :: LispVal -> LispVal
-numberp (Number _) = Bool True
-numberp _ = Bool False
+strToSymb (String s) = return (Atom s)
+strToSymb s = throwError $ TypeMismatch "string" s
 
-boolp :: LispVal -> LispVal
-boolp   (Bool _)   = Bool True
-boolp   _          = Bool False
+numberp (Number _) = return $ Bool True
+numberp _          = return $ Bool False
 
-listp :: LispVal -> LispVal
-listp   (List _)   = Bool True
-listp   (DottedList _ _) = Bool False
-listp   _          = Bool False
+stringp (String _) = return $ Bool True
+stringp _          = return $ Bool False
+
+boolp   (Bool _)   = return  $ Bool True
+boolp   _          = return $ Bool False
+
+listp   (List _)   = return $ Bool True
+listp   (DottedList _ _) = return $ Bool True
+listp   _          = return $ Bool False
 
 symbol :: Parser Char
 symbol = oneOf "!$%&|*+-/:<=>?@^_~"
 
 
-unpackNum :: LispVal -> Integer
-unpackNum (Number n) = n
-unpackNum _ = 0
+
+unpackNum :: LispVal -> ThrowsError Integer
+unpackNum (Number n) = return n
+unpackNum (String n) = let parsed = reads n in 
+                           if null parsed 
+                             then throwError $ TypeMismatch "number" $ String n
+                             else return $ fst $ parsed !! 0
+unpackNum (List [n]) = unpackNum n
+unpackNum notNum     = throwError $ TypeMismatch "number" notNum
+-- unpackNum :: LispVal -> Integer
+-- unpackNum (Number n) = n
+-- unpackNum _ = 0
 -- unpackNum (String n) = let parsed = reads n :: [(Integer, String)] in 
 --                            if null parsed 
 --                               then 0
@@ -244,22 +264,25 @@ unwordsList :: [LispVal] -> String
 unwordsList = unwords . map showVal
 
 
-eval :: LispVal -> LispVal
-eval val@(String _) = val
-eval val@(Number _) = val
-eval val@(Bool _) = val
-eval (List [Atom "quote", val]) = val
-eval (List (Atom func : args)) = apply func (map eval args)
+eval :: LispVal -> ThrowsError LispVal
+eval val@(String _) = return val
+eval val@(Number _) = return val
+eval val@(Bool _) = return val
+eval (List [Atom "quote", val]) = return val
+eval (List (Atom func : args)) = mapM eval args >>= apply func
+eval badForm = throwError $ BadSpecialForm "Unrecognized special form" badForm
 
 
-readExpr :: String -> LispVal
+readExpr :: String -> ThrowsError LispVal
 readExpr input = case parse parseExpr "lisp" input of
-    Left err -> String $ "No match: " ++ (show err)
-    Right val -> val
+    Left err -> throwError $ Parser err
+    Right val -> return val
 
 
-apply :: String -> [LispVal] -> LispVal
-apply func args = maybe (Bool False) ($ args) $ lookup func primitives
+apply :: String -> [LispVal] -> ThrowsError LispVal
+apply func args = maybe (throwError $ NotFunction "Unrecognized primitive function args" func)
+                        ($ args)
+                        (lookup func primitives)
 
 
 showVal :: LispVal -> String
@@ -271,10 +294,31 @@ showVal (Bool x)    | x == True = "#t"
 showVal (List x) = "(" ++ (unwordsList x) ++ ")"
 showVal (DottedList head tail) = "(" ++ (unwordsList head) ++ (showVal tail) ++ ")"
 
+showError :: LispError -> String
+showError (UnboundVar message varname)  = message ++ ": " ++ varname
+showError (BadSpecialForm message form) = message ++ ": " ++ show form
+showError (NotFunction message func)    = message ++ ": " ++ show func
+showError (NumArgs expected found)      = "Expected " ++ show expected 
+                                       ++ " args; found values " ++ unwordsList found
+showError (TypeMismatch expected found) = "Invalid type: expected " ++ expected
+                                       ++ ", found " ++ show found
+showError (Parser parseErr)             = "Parse error at " ++ show parseErr
+
+trapError action = catchError action (return . show)
+
+extractValue :: ThrowsError a -> a
+extractValue (Right val) = val
+
+
+
 
 
 main :: IO ()
-main = getArgs >>= print . eval . readExpr . head
+main = do
+        args <- getArgs
+        evaled <- return $ liftM show $ readExpr (args !! 0) >>= eval
+        putStrLn $ extractValue $ trapError evaled
+-- main = getArgs >>= print . eval . readExpr . head
 -- main = do 
 --     (expr:_) <- getArgs
 --     putStrLn (readExpr expr)
